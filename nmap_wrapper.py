@@ -255,7 +255,7 @@ def print_banner() -> None:
     t.append("   | || | | | | | | |   | | | | || |  \n",                         style="bold magenta")
     t.append("   | || |_| | |_| | |___| | |_| || |  \n",                         style="bold magenta")
     t.append("   |_| \\___/ \\___/|_____|_|\\___/ |_|  \n",                       style="bold magenta")
-    t.append("\n  Modular Pentesting Toolkit  v2.0  MIT License\n",              style="dim")
+    t.append("\n  Modular Pentesting Toolkit  - All rights reserved\n",              style="dim")
     t.append("  github.com/stanv21/nmap-tui\n",                                  style="dim")
     console.print(Panel(t, border_style="cyan", box=box.DOUBLE_EDGE))
 
@@ -442,10 +442,139 @@ def _rerun_nmap_with_flag(
 # SECTION 7 -- Recon and Scanning module (Nmap)
 # =============================================================================
 
+def get_local_subnet() -> str | None:
+    """
+    Detect the local machine's active IPv4 subnet in CIDR notation
+    (e.g. '192.168.1.0/24') by parsing the output of `ip route`.
+
+    We look for the line that contains 'src' and a private RFC-1918
+    address, which is the route nmap would use for LAN scanning.
+    Falls back to the first non-loopback network route if no 'src'
+    line is found.
+
+    Returns the CIDR string on success, or None on any failure.
+    """
+    try:
+        result = subprocess.run(
+            ["ip", "route"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+
+        # Strategy 1 -- look for the default route's 'src' address.
+        # `ip route` output looks like:
+        #   default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.42 ...
+        # We can also find lines like:
+        #   192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.42
+        # We prefer the latter because it already gives us the subnet CIDR.
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            # A line that starts with a CIDR and contains 'src' is perfect --
+            # it gives us the subnet directly without any arithmetic.
+            if (
+                parts
+                and "/" in parts[0]
+                and "src" in parts
+                and not parts[0].startswith("default")
+            ):
+                cidr = parts[0]
+                # Quick sanity-check: must look like a private IPv4 CIDR
+                if _CIDR_RE.match(cidr):
+                    return cidr
+
+        # Strategy 2 -- derive the subnet from the 'src' IP on the default route.
+        # We find the src IP, then look for a matching route line to get prefix len.
+        src_ip = None
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if "src" in parts:
+                idx = parts.index("src")
+                if idx + 1 < len(parts):
+                    candidate = parts[idx + 1]
+                    if _IPV4_RE.match(candidate) and not candidate.startswith("127."):
+                        src_ip = candidate
+                        break
+
+        if src_ip is None:
+            return None
+
+        # Find the network CIDR whose range contains src_ip
+        src_octets = list(map(int, src_ip.split(".")))
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if not parts or "/" not in parts[0]:
+                continue
+            try:
+                net, prefix_str = parts[0].split("/")
+                prefix = int(prefix_str)
+                net_octets = list(map(int, net.split(".")))
+                # Check if src_ip belongs to this network via bitmask
+                mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+                net_int = sum(o << (24 - 8 * i) for i, o in enumerate(net_octets))
+                src_int = sum(o << (24 - 8 * i) for i, o in enumerate(src_octets))
+                if (src_int & mask) == (net_int & mask):
+                    return f"{net}/{prefix}"
+            except (ValueError, IndexError):
+                continue
+
+        return None
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # `ip` not found (e.g. running on Windows) or timed out
+        return None
+
+
 def _prompt_nmap_target() -> str:
-    """Prompt for and validate a scan target."""
+    """
+    Present the user with two target-input options:
+      1. Auto-detect and use the local network CIDR  (quality-of-life shortcut)
+      2. Enter a custom target manually
+
+    If auto-detection fails, falls through silently to manual input.
+    """
+    detected_subnet = get_local_subnet()
+
+    # Build the choice list dynamically based on whether detection succeeded
+    target_choices = []
+    if detected_subnet:
+        target_choices.append(
+            Choice(
+                value="auto",
+                name=f"Auto-detect local network  (detected: {detected_subnet})",
+            )
+        )
+    target_choices.append(
+        Choice(value="manual", name="Enter a custom target  (IP, range, domain)")
+    )
+
+    if detected_subnet is None:
+        print_warning(
+            "Could not auto-detect the local subnet "
+            "(is the network interface up?). Falling back to manual input."
+        )
+
+    # If auto-detect succeeded, show the choice menu; otherwise skip straight
+    # to manual input (no point showing a one-item menu).
+    if detected_subnet:
+        input_mode = inquirer.select(
+            message="How would you like to specify the target?",
+            choices=target_choices,
+            pointer=">",
+            instruction="(Use up/down arrows, Enter to select)",
+        ).execute()
+    else:
+        input_mode = "manual"
+
+    if input_mode == "auto":
+        print_success(f"Target set to local network: [bold]{detected_subnet}[/]")
+        return detected_subnet
+
+    # Manual input path -- same validated loop as before
     console.print(
-        "  Accepted formats: [cyan]192.168.1.1[/]  |  [cyan]192.168.1.0/24[/]  "
+        "\n  Accepted formats: [cyan]192.168.1.1[/]  |  [cyan]192.168.1.0/24[/]  "
         "|  [cyan]192.168.1.1-50[/]  |  [cyan]scanme.nmap.org[/]\n"
     )
     while True:
@@ -503,7 +632,7 @@ def run_nmap_module(is_root: bool) -> None:
 
     # Outer loop: lets the user scan a new target without going to main menu
     while True:
-        print_section("Step 1 -- Enter Target", color="cyan")
+        print_section("Step 1 -- Select Target", color="cyan")
         target = _prompt_nmap_target()
 
         # Inner loop: multiple scans against the same target
