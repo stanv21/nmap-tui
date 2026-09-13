@@ -1,0 +1,8 @@
+﻿# NmapTUI — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Interactive prompts, select menus, text inputs, confirmations
+InquirerPy>=0.3.4
+
+# Beautiful terminal output: panels, styled text, rules
+rich>=13.0.0
