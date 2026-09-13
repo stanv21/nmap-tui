@@ -149,20 +149,6 @@ nmap-tui/
 > The authors accept no liability for misuse of this tool.
 
 
----
-
-## Contributing
-
-Pull requests are welcome. Please open an issue first to discuss major changes.
-
-1. Fork the repo
-2. Create a branch: `git checkout -b feature/my-feature`
-3. Commit your changes: `git commit -m "Add my feature"`
-4. Push to the branch: `git push origin feature/my-feature`
-5. Open a pull request
-
----
-
 ## License
 
 **All Rights Reserved.** 
