@@ -3,7 +3,7 @@
 An interactive, educational terminal UI wrapper for Nmap -- scan networks without memorising flags.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
-![License](https://img.shields.io/badge/License-MIT-green)
+![License](https://img.shields.io/badge/License-All%20Rights%20Reserved-red)
 ![Platform](https://img.shields.io/badge/Platform-Kali%20Linux-purple?logo=linux)
 
 ---
