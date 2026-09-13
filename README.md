@@ -16,7 +16,7 @@ An interactive, educational terminal UI wrapper for Nmap -- scan networks withou
 |  | |\  | |  | |/ ___ \|  __/    | | | |_| || |         |
 |  |_| \_|_|  |_/_/   \_\_|       |_|  \___/|___|        |
 |                                                          |
-|    Interactive Nmap Wrapper  v1.0  MIT License           |
+|   Interactive Nmap Wrapper-All Rights Reserved           |
 +----------------------------------------------------------+
 ```
 

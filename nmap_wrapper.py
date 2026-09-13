@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-nmap_wrapper.py -- NmapTUI v1.0
-An interactive terminal UI wrapper for Nmap.
+nmap_wrapper.py -- Modular Pentesting Toolkit v2.0
+An interactive terminal UI for common penetration testing tasks.
 
 Author : Stan V
 License: MIT
@@ -20,7 +20,7 @@ import datetime
 from pathlib import Path
 
 # -----------------------------------------------------------------------------
-# Third-party imports  (InquirerPy + rich for pretty output)
+# Third-party imports  (InquirerPy + rich)
 # -----------------------------------------------------------------------------
 try:
     from InquirerPy import inquirer
@@ -36,29 +36,38 @@ try:
     from rich.panel import Panel
     from rich.text import Text
     from rich import box
+    from rich.table import Table
 except ImportError:
     print("[ERROR] rich is not installed.")
     print("        Run:  pip install rich")
     sys.exit(1)
 
-
 # -----------------------------------------------------------------------------
-# Global console (rich) -- single instance used throughout the app
+# Global rich console -- one instance used everywhere
 # -----------------------------------------------------------------------------
 console = Console()
 
 
 # =============================================================================
-# SECTION 1 -- Startup checks
+# SECTION 1 -- Startup and dependency checks
 # =============================================================================
+
+def check_tool_installed(tool: str) -> bool:
+    """
+    Generic check: return True if `tool` exists on the system PATH.
+    Used at startup (nmap) and lazily when a module is entered
+    (hydra, gobuster, dirb), so users only fail when they actually
+    need the missing tool.
+    """
+    return shutil.which(tool) is not None
+
 
 def check_nmap_installed() -> None:
     """
-    Verify that `nmap` is present on the system PATH.
-    If it is not found, print a helpful error and exit immediately so the
-    user never reaches a scan selection they cannot actually run.
+    Hard-fail at startup if nmap is missing.
+    The recon module cannot function without it.
     """
-    if shutil.which("nmap") is None:
+    if not check_tool_installed("nmap"):
         console.print(
             Panel(
                 "[bold red]nmap is not installed or not found in PATH.[/]\n\n"
@@ -73,8 +82,8 @@ def check_nmap_installed() -> None:
 
 def check_root_privileges() -> bool:
     """
-    Return True if the script is being run as root (UID 0), False otherwise.
-    On non-POSIX systems (Windows) this always returns False.
+    Return True when running as root (UID 0).
+    Returns False on non-POSIX platforms (Windows).
     """
     try:
         return os.getuid() == 0
@@ -83,17 +92,14 @@ def check_root_privileges() -> bool:
 
 
 # =============================================================================
-# SECTION 2 -- Scan profile catalogue
+# SECTION 2 -- Nmap scan profile catalogue
 # =============================================================================
 
-# Each profile is a dict with:
-#   name          -- human-readable label shown in the menu
-#   flags         -- list of nmap flag strings
-#   requires_root -- whether the scan needs elevated privileges
-#   description   -- one-line educational explanation shown before the scan
-#
-# Keeping profiles as plain data (not hard-coded inside a function) makes
-# it trivial to add new profiles in future versions.
+# Each profile dict contains:
+#   name          -- label shown in the menu
+#   flags         -- list of nmap argument strings
+#   requires_root -- True if the scan needs raw-socket privileges
+#   description   -- educational one-liner displayed before execution
 
 SCAN_PROFILES: list[dict] = [
     {
@@ -147,7 +153,7 @@ SCAN_PROFILES: list[dict] = [
         "flags": ["-O", "-v"],
         "requires_root": True,
         "description": (
-            "Attempts to determine the target's operating system via TCP/IP "
+            "Attempts to determine the target operating system via TCP/IP "
             "fingerprinting. Requires at least one open and one closed port."
         ),
     },
@@ -174,7 +180,7 @@ SCAN_PROFILES: list[dict] = [
         "flags": ["-sU", "-v"],
         "requires_root": True,
         "description": (
-            "Scans UDP ports. Much slower than TCP scans because UDP gives no "
+            "Scans UDP ports. Much slower than TCP because UDP gives no "
             "guaranteed response. Requires root."
         ),
     },
@@ -200,27 +206,20 @@ _RANGE_RE  = re.compile(r"^(\d{1,3}\.){3}\d{1,3}-\d{1,3}$")
 _DOMAIN_RE = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
 )
+_URL_RE    = re.compile(r"^https?://[^\s]+$")
 
 
-def is_valid_target(target: str) -> bool:
+def is_valid_ip_or_host(target: str) -> bool:
     """
-    Return True if target looks like a valid nmap target:
-      - IPv4 address       (e.g. 192.168.1.1)
-      - CIDR subnet        (e.g. 192.168.1.0/24)
-      - Hyphen range       (e.g. 192.168.1.1-50)
-      - Hostname / domain  (e.g. scanme.nmap.org)
-    Shell meta-characters are rejected as a belt-and-braces safety measure.
-    subprocess with a list already prevents shell injection, but being
-    explicit here is good defensive practice.
+    Validate a target as an IPv4 address, CIDR subnet, hyphen range,
+    or hostname.  Shell metacharacters are blocked defensively.
     """
     target = target.strip()
     if not target:
         return False
-
     forbidden = set(';|&`$(){}\\\'\"<>')
     if any(ch in forbidden for ch in target):
         return False
-
     return bool(
         _IPV4_RE.match(target)
         or _CIDR_RE.match(target)
@@ -229,44 +228,59 @@ def is_valid_target(target: str) -> bool:
     )
 
 
+def is_valid_url(url: str) -> bool:
+    """Return True if the string is a valid http/https URL."""
+    return bool(_URL_RE.match(url.strip()))
+
+
+def is_non_empty(value: str) -> bool:
+    """Return True if value is not blank."""
+    return bool(value.strip())
+
+
 # =============================================================================
 # SECTION 4 -- UI helpers
 # =============================================================================
 
 def print_banner() -> None:
-    """Print the application welcome banner."""
-    banner_text = Text()
-    banner_text.append("  _   _ __  __    _    ____    _____ _   _ ___ \n", style="bold cyan")
-    banner_text.append(" | \\ | |  \\/  |  / \\  |  _ \\  |_   _| | | |_ _|\n", style="bold cyan")
-    banner_text.append(" |  \\| | |\\/| | / _ \\ | |_) |   | | | | | || | \n", style="bold cyan")
-    banner_text.append(" | |\\  | |  | |/ ___ \\|  __/    | | | |_| || | \n", style="bold cyan")
-    banner_text.append(" |_| \\_|_|  |_/_/   \\_\\_|       |_|  \\___/|___|\n", style="bold cyan")
-    banner_text.append("\n  Interactive Nmap Wrapper  v1.0  MIT License\n", style="dim")
-    console.print(Panel(banner_text, border_style="cyan", box=box.DOUBLE_EDGE))
+    """Print the toolkit welcome banner."""
+    t = Text()
+    t.append("  ____  _____ _   _ _____ _____ ____ _____ ___ _   _  ____ \n",  style="bold cyan")
+    t.append(" |  _ \\| ____| \\ | |_   _| ____/ ___|_   _|_ _| \\ | |/ ___|\n", style="bold cyan")
+    t.append(" | |_) |  _| |  \\| | | | |  _| \\___ \\ | |  | ||  \\| | |  _\n",  style="bold cyan")
+    t.append(" |  __/| |___| |\\  | | | | |___ ___) || |  | || |\\  | |_| |\n",  style="bold cyan")
+    t.append(" |_|   |_____|_| \\_| |_| |_____|____/ |_| |___|_| \\_|\\____|\n",  style="bold cyan")
+    t.append("  _____ ___   ___  _     _  ___ _____ \n",                         style="bold magenta")
+    t.append(" |_   _/ _ \\ / _ \\| |   | |/ _ \\_   _|\n",                       style="bold magenta")
+    t.append("   | || | | | | | | |   | | | | || |  \n",                         style="bold magenta")
+    t.append("   | || |_| | |_| | |___| | |_| || |  \n",                         style="bold magenta")
+    t.append("   |_| \\___/ \\___/|_____|_|\\___/ |_|  \n",                       style="bold magenta")
+    t.append("\n  Modular Pentesting Toolkit  v2.0  MIT License\n",              style="dim")
+    t.append("  github.com/stanv21/nmap-tui\n",                                  style="dim")
+    console.print(Panel(t, border_style="cyan", box=box.DOUBLE_EDGE))
 
 
-def print_info(message: str) -> None:
-    console.print(f"[bold cyan][INFO][/] {message}")
+def print_section(title: str, color: str = "cyan") -> None:
+    """Print a full-width section divider."""
+    console.print()
+    console.rule(f"[bold {color}]{title}[/]")
+    console.print()
 
-def print_warning(message: str) -> None:
-    console.print(f"[bold yellow][WARN][/] {message}")
 
-def print_error(message: str) -> None:
-    console.print(f"[bold red][ERR ][/] {message}")
-
-def print_success(message: str) -> None:
-    console.print(f"[bold green][OK  ][/] {message}")
+def print_info(msg: str)    -> None: console.print(f"[bold cyan][INFO][/] {msg}")
+def print_warning(msg: str) -> None: console.print(f"[bold yellow][WARN][/] {msg}")
+def print_error(msg: str)   -> None: console.print(f"[bold red][ERR ][/] {msg}")
+def print_success(msg: str) -> None: console.print(f"[bold green][OK  ][/] {msg}")
 
 
 def print_command(command: list[str]) -> None:
     """
-    Display the exact nmap command about to run.
-    This is the educational core of the app -- users learn real flags.
+    Display the exact command about to run.
+    Educational core -- users see real tool syntax and flags.
     """
-    cmd_str = " ".join(command)
     console.print(
         Panel(
-            f"[bold white]{cmd_str}[/]",
+            f"[bold white]{' '.join(command)}[/]",
             title="[bold yellow]Running Command[/]",
             border_style="yellow",
             subtitle="[dim]Copy this into your terminal to run it manually[/]",
@@ -275,109 +289,18 @@ def print_command(command: list[str]) -> None:
 
 
 # =============================================================================
-# SECTION 5 -- Target selection
+# SECTION 5 -- Shared subprocess execution (live-streaming)
 # =============================================================================
 
-def prompt_for_target() -> str:
+def stream_command(command: list[str], tool_name: str = "process") -> str:
     """
-    Interactively ask the user for a scan target and loop until a valid
-    value is entered. Returns the validated target string.
+    Execute any command and stream its output to the terminal line by line.
+
+    Using subprocess.Popen with bufsize=1 (line-buffered) ensures output
+    appears in real time rather than buffered until the process exits.
+
+    Returns the full captured output as a string so it can be saved.
     """
-    console.print()
-    console.rule("[bold cyan]Step 1 -- Enter Target[/]")
-    console.print(
-        "  Accepted formats: [cyan]192.168.1.1[/]  |  [cyan]192.168.1.0/24[/]  "
-        "|  [cyan]192.168.1.1-50[/]  |  [cyan]scanme.nmap.org[/]\n"
-    )
-
-    while True:
-        target = inquirer.text(
-            message="Target (IP / subnet / hostname):",
-            validate=lambda t: is_valid_target(t),
-            invalid_message="Invalid target. Enter an IP, CIDR range, or hostname.",
-        ).execute()
-
-        target = target.strip()
-        if is_valid_target(target):
-            return target
-
-
-# =============================================================================
-# SECTION 6 -- Scan profile selection menu
-# =============================================================================
-
-def build_scan_choices(is_root: bool) -> list:
-    """
-    Build the InquirerPy choice list from SCAN_PROFILES.
-    Root-only profiles are hidden when running as a non-root user.
-    """
-    choices = []
-    for idx, profile in enumerate(SCAN_PROFILES):
-        if profile["requires_root"] and not is_root:
-            continue
-        choices.append(Choice(value=idx, name=profile["name"]))
-
-    choices.append(Separator())
-    choices.append(Choice(value="exit", name="Exit"))
-    return choices
-
-
-def prompt_for_scan_profile(is_root: bool) -> dict | None:
-    """
-    Show the interactive scan-profile menu.
-    Returns the selected profile dict, or None if the user chose to exit.
-    """
-    console.print()
-    console.rule("[bold cyan]Step 2 -- Choose Scan Type[/]")
-
-    if not is_root:
-        print_warning(
-            "Running WITHOUT root. Root-only scans are hidden.\n"
-            "         Re-run with [bold]sudo python3 nmap_wrapper.py[/] to unlock all scans."
-        )
-        console.print()
-
-    choices = build_scan_choices(is_root)
-
-    selected_value = inquirer.select(
-        message="Select a scan profile:",
-        choices=choices,
-        default=None,
-        pointer=">",
-        instruction="(Use up/down arrows, Enter to select)",
-    ).execute()
-
-    if selected_value == "exit":
-        return None
-
-    return SCAN_PROFILES[selected_value]
-
-
-# =============================================================================
-# SECTION 7 -- Command builder
-# =============================================================================
-
-def build_nmap_command(target: str, profile: dict) -> list[str]:
-    """
-    Assemble the nmap command as a list of strings.
-    Using a list (not a single string) prevents shell-injection attacks
-    and handles arguments correctly without needing shell=True.
-    """
-    return ["nmap"] + profile["flags"] + [target]
-
-
-# =============================================================================
-# SECTION 8 -- Scan execution with live-streaming output
-# =============================================================================
-
-def run_scan(command: list[str]) -> str:
-    """
-    Execute the nmap command and stream each line of output to the terminal
-    in real time. Returns the full captured output as a string for saving.
-    """
-    console.print()
-    console.rule("[bold green]Scan Output[/]")
-
     output_lines: list[str] = []
     process = None
 
@@ -385,9 +308,9 @@ def run_scan(command: list[str]) -> str:
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,   # merge stderr into stdout
-            text=True,                  # auto-decode bytes to str
-            bufsize=1,                  # line-buffered for real-time streaming
+            stderr=subprocess.STDOUT,  # merge stderr so warnings appear inline
+            text=True,
+            bufsize=1,                 # line-buffered for real-time output
         )
 
         for line in process.stdout:
@@ -396,158 +319,212 @@ def run_scan(command: list[str]) -> str:
             output_lines.append(stripped)
 
         process.wait()
-
         console.print()
+
         if process.returncode == 0:
-            print_success(f"Scan completed (exit code {process.returncode}).")
+            print_success(f"{tool_name} finished (exit code {process.returncode}).")
         else:
-            print_warning(f"nmap exited with code {process.returncode}.")
+            print_warning(
+                f"{tool_name} exited with code {process.returncode}. "
+                "Check output above for details."
+            )
 
     except KeyboardInterrupt:
         console.print()
-        print_warning("Scan interrupted by user (Ctrl-C).")
+        print_warning("Interrupted by user (Ctrl-C).")
         if process and process.poll() is None:
             process.terminate()
 
     except FileNotFoundError:
-        print_error("nmap binary not found. Is it installed?")
+        print_error(f"'{tool_name}' binary not found. Is it installed?")
 
     return "\n".join(output_lines)
 
 
 # =============================================================================
-# SECTION 9 -- Report saving
+# SECTION 6 -- Report / output saving
 # =============================================================================
 
-def prompt_save_report(scan_output: str, target: str, profile: dict) -> None:
+def prompt_save_output(
+    output: str,
+    prefix: str,
+    target_label: str,
+    nmap_extra_formats: bool = False,
+    nmap_profile: dict | None = None,
+    nmap_target: str | None = None,
+) -> None:
     """
-    Ask whether to save the scan output, and in which format:
-      Normal text  -- written directly from our captured buffer
-      XML          -- nmap re-run with -oX (nmap writes structured XML)
-      Grepable     -- nmap re-run with -oG (easy to process with grep/awk)
+    Ask the user whether to save captured output and in which format.
+
+    For Nmap output, extra format options (XML, Grepable) are offered
+    because nmap can write these natively in a structured way.
+    All reports are saved under pentest_reports/ in the cwd.
     """
     console.print()
-    console.rule("[bold cyan]Step 3 -- Save Report[/]")
+    console.rule("[bold cyan]Save Output[/]")
 
     save = inquirer.confirm(
-        message="Would you like to save the scan output to a file?",
+        message="Would you like to save the output to a file?",
         default=False,
     ).execute()
 
     if not save:
-        print_info("Report not saved.")
+        print_info("Output not saved.")
         return
 
-    fmt_choice = inquirer.select(
-        message="Choose output format:",
-        choices=[
-            Choice(value="normal",   name="Normal text  (.txt)  -- same as terminal output"),
-            Choice(value="xml",      name="XML          (.xml)  -- machine-readable"),
-            Choice(value="grepable", name="Grepable     (.gnmap) -- easy to grep/awk"),
-            Choice(value="all",      name="All three formats at once"),
-        ],
-        pointer=">",
-    ).execute()
+    # Build format choices -- XML/Grepable only shown for nmap
+    format_choices = [Choice(value="txt", name="Plain text  (.txt)")]
+    if nmap_extra_formats:
+        format_choices += [
+            Choice(value="xml",   name="XML         (.xml)   -- machine-readable"),
+            Choice(value="gnmap", name="Grepable    (.gnmap)  -- easy to grep/awk"),
+            Choice(value="all",   name="All three formats at once"),
+        ]
 
-    timestamp   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_target = re.sub(r"[^\w.\-]", "_", target)
-    base_name   = f"nmap_{safe_target}_{timestamp}"
+    fmt = (
+        inquirer.select(
+            message="Choose output format:",
+            choices=format_choices,
+            pointer=">",
+        ).execute()
+        if len(format_choices) > 1
+        else "txt"
+    )
 
-    save_dir = Path.cwd() / "nmap_reports"
+    timestamp  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_label = re.sub(r"[^\w.\-]", "_", target_label)
+    base_name  = f"{prefix}_{safe_label}_{timestamp}"
+
+    save_dir = Path.cwd() / "pentest_reports"
     save_dir.mkdir(exist_ok=True)
 
     saved_files: list[str] = []
 
-    if fmt_choice in ("normal", "all"):
-        txt_path = save_dir / f"{base_name}.txt"
-        txt_path.write_text(scan_output, encoding="utf-8")
-        saved_files.append(str(txt_path))
+    if fmt in ("txt", "all"):
+        p = save_dir / f"{base_name}.txt"
+        p.write_text(output, encoding="utf-8")
+        saved_files.append(str(p))
 
-    if fmt_choice in ("xml", "all"):
-        xml_path = save_dir / f"{base_name}.xml"
-        _rerun_nmap_with_output_flag(target, profile, "-oX", str(xml_path))
-        saved_files.append(str(xml_path))
+    if fmt in ("xml", "all") and nmap_profile and nmap_target:
+        p = save_dir / f"{base_name}.xml"
+        _rerun_nmap_with_flag(nmap_target, nmap_profile, "-oX", str(p))
+        saved_files.append(str(p))
 
-    if fmt_choice in ("grepable", "all"):
-        gnmap_path = save_dir / f"{base_name}.gnmap"
-        _rerun_nmap_with_output_flag(target, profile, "-oG", str(gnmap_path))
-        saved_files.append(str(gnmap_path))
+    if fmt in ("gnmap", "all") and nmap_profile and nmap_target:
+        p = save_dir / f"{base_name}.gnmap"
+        _rerun_nmap_with_flag(nmap_target, nmap_profile, "-oG", str(p))
+        saved_files.append(str(p))
 
     console.print()
     for fp in saved_files:
         print_success(f"Saved: [bold]{fp}[/]")
 
 
-def _rerun_nmap_with_output_flag(
+def _rerun_nmap_with_flag(
     target: str, profile: dict, flag: str, filepath: str
 ) -> None:
     """
-    Re-run nmap silently with an output flag so nmap itself writes a
-    correctly structured file (XML/Grepable formats).
+    Re-run nmap silently with an output-format flag (-oX / -oG).
+    nmap writes these formats natively; we cannot produce them from
+    the plain-text buffer we already captured.
     """
     command = ["nmap"] + profile["flags"] + [flag, filepath, target]
-    print_info(f"Writing {flag} output to: {filepath}")
+    print_info(f"Writing {flag} file to: {filepath}")
     try:
         subprocess.run(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
         )
     except Exception as exc:
-        print_error(f"Failed to generate {flag} output: {exc}")
+        print_error(f"Failed to write {flag} output: {exc}")
 
 
 # =============================================================================
-# SECTION 10 -- Main application loop
+# SECTION 7 -- Recon and Scanning module (Nmap)
 # =============================================================================
 
-def main() -> None:
+def _prompt_nmap_target() -> str:
+    """Prompt for and validate a scan target."""
+    console.print(
+        "  Accepted formats: [cyan]192.168.1.1[/]  |  [cyan]192.168.1.0/24[/]  "
+        "|  [cyan]192.168.1.1-50[/]  |  [cyan]scanme.nmap.org[/]\n"
+    )
+    while True:
+        target = inquirer.text(
+            message="Target (IP / subnet / hostname):",
+            validate=lambda t: is_valid_ip_or_host(t),
+            invalid_message="Invalid. Enter a valid IP, CIDR range, or hostname.",
+        ).execute().strip()
+        if is_valid_ip_or_host(target):
+            return target
+
+
+def _build_nmap_choices(is_root: bool) -> list:
     """
-    Application entry point.
-
-    Flow:
-      1. Banner + dependency / privilege checks + legal disclaimer
-      2. Target selection (with validation)
-      3. Scan profile menu (root-gated options)
-      4. Educational command preview
-      5. User confirmation
-      6. Live-streaming scan execution
-      7. Optional report saving
-      8. Continue / new target / exit prompt
+    Build the scan-profile choice list.
+    Root-required profiles are hidden when the user is not root.
     """
-    print_banner()
-    check_nmap_installed()
+    choices = []
+    for idx, profile in enumerate(SCAN_PROFILES):
+        if profile["requires_root"] and not is_root:
+            continue
+        choices.append(Choice(value=idx, name=profile["name"]))
+    choices.append(Separator())
+    choices.append(Choice(value="back", name="Back to Main Menu"))
+    return choices
 
-    is_root = check_root_privileges()
-    if is_root:
-        print_success("Running as [bold]root[/] -- all scan types are available.")
-    else:
-        print_warning("Running as non-root -- some advanced scans require sudo.")
 
+def run_nmap_module(is_root: bool) -> None:
+    """
+    Recon and Scanning module entry point.
+
+    Handles the full Nmap workflow:
+      - Target input and validation
+      - Scan-profile selection (root-gated where needed)
+      - Educational command preview
+      - Live-streamed execution
+      - Optional report saving
+    Returns when the user navigates back to the main menu.
+    """
     console.print(
         Panel(
-            "[bold yellow]Legal and Ethical Reminder[/]\n\n"
-            "Only scan hosts and networks that you [bold]own[/] or have "
-            "[bold]explicit written permission[/] to test.\n"
-            "Unauthorised port scanning may be illegal in your jurisdiction.",
-            border_style="yellow",
+            "[bold cyan]Recon and Scanning Module[/]\n\n"
+            "Use Nmap to discover hosts, open ports, running services,\n"
+            "operating systems, and known vulnerabilities.\n\n"
+            "Every command is displayed before execution so you learn the flags.",
+            border_style="cyan",
         )
     )
 
+    if not is_root:
+        print_warning(
+            "Running WITHOUT root. Root-only profiles are hidden.\n"
+            "         Re-run with [bold]sudo python3 nmap_wrapper.py[/] to unlock them."
+        )
+
+    # Outer loop: lets the user scan a new target without going to main menu
     while True:
-        target = prompt_for_target()
+        print_section("Step 1 -- Enter Target", color="cyan")
+        target = _prompt_nmap_target()
 
+        # Inner loop: multiple scans against the same target
         while True:
-            profile = prompt_for_scan_profile(is_root)
+            print_section("Step 2 -- Choose Scan Type", color="cyan")
 
-            if profile is None:
-                console.print()
-                print_info("Goodbye! Stay ethical.")
-                sys.exit(0)
+            selected = inquirer.select(
+                message="Select a scan profile:",
+                choices=_build_nmap_choices(is_root),
+                default=None,
+                pointer=">",
+                instruction="(Use up/down arrows, Enter to select)",
+            ).execute()
 
+            if selected == "back":
+                return  # exit module -- back to main menu
+
+            profile = SCAN_PROFILES[selected]
+
+            # Educational description panel
             console.print()
-            console.rule("[bold cyan]Scan Info[/]")
             console.print(
                 Panel(
                     profile["description"],
@@ -556,39 +533,370 @@ def main() -> None:
                 )
             )
 
-            command = build_nmap_command(target, profile)
+            command = ["nmap"] + profile["flags"] + [target]
             print_command(command)
 
-            confirmed = inquirer.confirm(
-                message="Proceed with this scan?",
-                default=True,
-            ).execute()
-
-            if not confirmed:
+            if not inquirer.confirm(
+                message="Proceed with this scan?", default=True
+            ).execute():
                 print_info("Scan cancelled. Choose another profile.")
                 continue
 
-            scan_output = run_scan(command)
-            prompt_save_report(scan_output, target, profile)
+            print_section("Scan Output", color="green")
+            output = stream_command(command, tool_name="nmap")
 
+            prompt_save_output(
+                output=output,
+                prefix="nmap",
+                target_label=target,
+                nmap_extra_formats=True,
+                nmap_profile=profile,
+                nmap_target=target,
+            )
+
+            # Post-scan navigation
             console.print()
             next_action = inquirer.select(
                 message="What would you like to do next?",
                 choices=[
                     Choice(value="rescan",     name="Run another scan on the same target"),
-                    Choice(value="new_target", name="Enter a new target"),
+                    Choice(value="new_target", name="Scan a different target"),
+                    Choice(value="menu",       name="Return to Main Menu"),
                     Choice(value="exit",       name="Exit"),
                 ],
                 pointer=">",
             ).execute()
 
             if next_action == "exit":
-                console.print()
-                print_info("Goodbye! Stay ethical.")
-                sys.exit(0)
+                _goodbye()
+            elif next_action == "menu":
+                return
             elif next_action == "new_target":
-                break   # break inner loop -- re-enter target
+                break       # break inner loop -- re-enter target above
             # "rescan" -- continue inner loop with same target
+
+
+# =============================================================================
+# SECTION 8 -- Attacks and Exploitation module
+# =============================================================================
+
+def _run_hydra_ssh() -> None:
+    """
+    SSH Brute Force sub-module using Hydra.
+
+    Prompts for target IP, port, username (single or list), and a
+    password wordlist.  Assembles and streams the hydra command.
+
+    Command structure:
+      hydra -l <user> -P <wordlist> -s <port> ssh://<target>
+      hydra -L <userlist> -P <wordlist> -s <port> ssh://<target>
+    """
+    if not check_tool_installed("hydra"):
+        console.print(
+            Panel(
+                "[bold red]hydra is not installed or not found in PATH.[/]\n\n"
+                "Install it with:\n"
+                "  [bold cyan]sudo apt update && sudo apt install hydra[/]",
+                title="[red]Dependency Missing[/]",
+                border_style="red",
+            )
+        )
+        return
+
+    print_section("SSH Brute Force -- hydra Configuration", color="red")
+
+    # Target
+    target = inquirer.text(
+        message="Target IP or hostname:",
+        validate=lambda t: is_valid_ip_or_host(t),
+        invalid_message="Enter a valid IP address or hostname.",
+    ).execute().strip()
+
+    # SSH port
+    port = inquirer.text(
+        message="SSH port (default 22):",
+        default="22",
+        validate=lambda p: p.strip().isdigit() and 1 <= int(p.strip()) <= 65535,
+        invalid_message="Enter a valid port number (1-65535).",
+    ).execute().strip()
+
+    # Username source
+    user_mode = inquirer.select(
+        message="Username input method:",
+        choices=[
+            Choice(value="single", name="Single username"),
+            Choice(value="list",   name="Username list file"),
+        ],
+        pointer=">",
+    ).execute()
+
+    if user_mode == "single":
+        username = inquirer.text(
+            message="Username:",
+            validate=is_non_empty,
+            invalid_message="Username cannot be blank.",
+        ).execute().strip()
+        user_flag = ["-l", username]
+    else:
+        user_file = inquirer.text(
+            message="Path to username list:",
+            validate=lambda p: Path(p.strip()).is_file(),
+            invalid_message="File not found. Enter a valid path.",
+        ).execute().strip()
+        user_flag = ["-L", user_file]
+
+    # Password wordlist
+    wordlist = inquirer.text(
+        message="Path to password wordlist:",
+        default="/usr/share/wordlists/rockyou.txt",
+        validate=lambda p: Path(p.strip()).is_file(),
+        invalid_message="File not found. Enter a valid path.",
+    ).execute().strip()
+
+    command = ["hydra"] + user_flag + ["-P", wordlist, "-s", port, f"ssh://{target}"]
+    print_command(command)
+
+    if not inquirer.confirm(
+        message="Proceed with this brute force attack?", default=True
+    ).execute():
+        print_info("Attack cancelled.")
+        return
+
+    print_section("Hydra Output", color="red")
+    output = stream_command(command, tool_name="hydra")
+    prompt_save_output(output=output, prefix="hydra_ssh", target_label=target)
+
+
+def _run_dir_bruteforce() -> None:
+    """
+    Web Directory Bruteforce sub-module.
+
+    Prefers gobuster (more actively maintained); falls back to dirb
+    when gobuster is not installed.  Prompts for a target URL and
+    wordlist, then streams the output.
+
+    gobuster command: gobuster dir -u <url> -w <wordlist>
+    dirb    command: dirb <url> <wordlist>
+    """
+    # Tool selection with automatic fallback
+    if check_tool_installed("gobuster"):
+        tool = "gobuster"
+    elif check_tool_installed("dirb"):
+        tool = "dirb"
+    else:
+        console.print(
+            Panel(
+                "[bold red]Neither gobuster nor dirb is installed.[/]\n\n"
+                "Install one with:\n"
+                "  [bold cyan]sudo apt install gobuster[/]\n"
+                "  [bold cyan]sudo apt install dirb[/]",
+                title="[red]Dependency Missing[/]",
+                border_style="red",
+            )
+        )
+        return
+
+    print_section(f"Directory Bruteforce -- {tool} Configuration", color="red")
+    console.print(
+        f"  [dim]Using tool: [bold]{tool}[/bold]. "
+        "Install gobuster for richer output.[/]\n"
+    )
+
+    # Target URL
+    url = inquirer.text(
+        message="Target URL (include http:// or https://):",
+        validate=lambda u: is_valid_url(u),
+        invalid_message="Enter a valid URL starting with http:// or https://",
+    ).execute().strip()
+
+    # Wordlist
+    wordlist = inquirer.text(
+        message="Path to wordlist:",
+        default="/usr/share/wordlists/dirb/common.txt",
+        validate=lambda p: Path(p.strip()).is_file(),
+        invalid_message="File not found. Enter a valid path.",
+    ).execute().strip()
+
+    # Build the tool-appropriate command
+    if tool == "gobuster":
+        command = ["gobuster", "dir", "-u", url, "-w", wordlist]
+    else:
+        command = ["dirb", url, wordlist]
+
+    print_command(command)
+
+    if not inquirer.confirm(
+        message="Proceed with this directory bruteforce?", default=True
+    ).execute():
+        print_info("Attack cancelled.")
+        return
+
+    print_section("Bruteforce Output", color="red")
+    output = stream_command(command, tool_name=tool)
+    safe_url = re.sub(r"[^\w.\-]", "_", url)
+    prompt_save_output(output=output, prefix=f"{tool}_dir", target_label=safe_url)
+
+
+def run_attack_module() -> None:
+    """
+    Attacks and Exploitation module entry point.
+
+    Shows a sub-menu of available attack tools.  Loops until the user
+    chooses to return to the main menu or exit.
+    """
+    console.print(
+        Panel(
+            "[bold red]Attacks and Exploitation Module[/]\n\n"
+            "[bold yellow]WARNING:[/] Only use these tools against systems you\n"
+            "own or have [bold]explicit written permission[/] to test.\n\n"
+            "Available attacks:\n"
+            "  [1] SSH Brute Force via Hydra\n"
+            "  [2] Web Directory Bruteforce via Gobuster / Dirb",
+            border_style="red",
+        )
+    )
+
+    while True:
+        print_section("Attack Selection", color="red")
+
+        choice = inquirer.select(
+            message="Choose an attack:",
+            choices=[
+                Choice(value="ssh_bf", name="[1] SSH Brute Force  (hydra)"),
+                Choice(value="dir_bf", name="[2] Directory Bruteforce  (gobuster / dirb)"),
+                Separator(),
+                Choice(value="back",   name="Back to Main Menu"),
+            ],
+            pointer=">",
+            instruction="(Use up/down arrows, Enter to select)",
+        ).execute()
+
+        if choice == "back":
+            return
+
+        if choice == "ssh_bf":
+            _run_hydra_ssh()
+        elif choice == "dir_bf":
+            _run_dir_bruteforce()
+
+        # Post-attack navigation
+        console.print()
+        follow_up = inquirer.select(
+            message="What would you like to do next?",
+            choices=[
+                Choice(value="another", name="Run another attack"),
+                Choice(value="menu",    name="Return to Main Menu"),
+                Choice(value="exit",    name="Exit"),
+            ],
+            pointer=">",
+        ).execute()
+
+        if follow_up == "exit":
+            _goodbye()
+        elif follow_up == "menu":
+            return
+        # "another" -- continue loop and show attack sub-menu again
+
+
+# =============================================================================
+# SECTION 9 -- Main menu and application entry point
+# =============================================================================
+
+def _goodbye() -> None:
+    """Print exit message and terminate."""
+    console.print()
+    print_info("Goodbye! Stay ethical.")
+    sys.exit(0)
+
+
+def show_main_menu() -> str:
+    """
+    Display the root-level main menu with a live tool-availability table.
+    Returns the user's choice key: 'nmap', 'attack', or 'exit'.
+    """
+    console.print()
+    console.rule("[bold cyan]Main Menu[/]")
+    console.print()
+
+    # Quick status table -- shows which tools are available at a glance
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    table.add_column(style="bold dim")
+    table.add_column()
+    for tool, label in [
+        ("nmap",     "Recon module"),
+        ("hydra",    "SSH brute force"),
+        ("gobuster", "Dir bruteforce (preferred)"),
+        ("dirb",     "Dir bruteforce (fallback)"),
+    ]:
+        status = (
+            "[green]installed[/]"
+            if check_tool_installed(tool)
+            else "[yellow]not found[/]"
+        )
+        table.add_row(f"{tool} ({label})", status)
+
+    console.print(table)
+    console.print()
+
+    return inquirer.select(
+        message="Choose a module:",
+        choices=[
+            Choice(value="nmap",   name="[1] Recon and Scanning      (Nmap)"),
+            Choice(value="attack", name="[2] Attacks and Exploitation  (Hydra / Gobuster)"),
+            Separator(),
+            Choice(value="exit",   name="Exit"),
+        ],
+        pointer=">",
+        instruction="(Use up/down arrows, Enter to select)",
+    ).execute()
+
+
+def main() -> None:
+    """
+    Application entry point.
+
+    Startup flow:
+      1. Print toolkit banner
+      2. Hard dependency check for nmap
+      3. Root privilege check (gates certain scan types)
+      4. Legal disclaimer
+      5. Main menu loop -- delegates to module functions
+         run_nmap_module()   for Recon and Scanning
+         run_attack_module() for Attacks and Exploitation
+    """
+    print_banner()
+    check_nmap_installed()
+
+    is_root = check_root_privileges()
+    if is_root:
+        print_success("Running as [bold]root[/] -- all features available.")
+    else:
+        print_warning(
+            "Running as non-root. Some Nmap scans may require sudo."
+        )
+
+    console.print(
+        Panel(
+            "[bold yellow]Legal and Ethical Reminder[/]\n\n"
+            "Only scan and test hosts and networks that you [bold]own[/] or have\n"
+            "[bold]explicit written permission[/] to test.\n"
+            "Unauthorised access or port scanning may be illegal in your jurisdiction.",
+            border_style="yellow",
+        )
+    )
+
+    # Main event loop -- returns here after every module finishes
+    while True:
+        choice = show_main_menu()
+
+        if choice == "nmap":
+            run_nmap_module(is_root)
+
+        elif choice == "attack":
+            run_attack_module()
+
+        elif choice == "exit":
+            _goodbye()
 
 
 if __name__ == "__main__":
